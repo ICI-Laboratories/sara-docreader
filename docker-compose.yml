@@ -1,3 +1,5 @@
+name: smartdoc
+
 services:
   api_gateway:
     build:
