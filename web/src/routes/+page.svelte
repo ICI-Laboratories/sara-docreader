@@ -1,6 +1,9 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
+  import { excerpt } from "$lib/search";
+  import { readerDestination, readerLocation } from "$lib/auth-navigation";
   import PdfViewer from "$lib/PdfViewer.svelte";
+  import Answer from "$lib/Answer.svelte";
   import { track, setMeasurement } from "$lib/analytics";
   let measurement = $state(true),
     measurementAvailable = $state(true),
@@ -23,6 +26,14 @@
     loginAvailable = $state(false),
     expiresIn = $state(86400);
   let leaving = $state(false);
+  let accountUrl = $state(""), returnPath = $state("/");
+  let user = $state<{ id: string; name?: string | null; email?: string | null } | null>(null);
+  let locationReady = $state(false);
+  let verifyingSession = false;
+  type Session = { mode: string; login_available: boolean; account_url?: string;
+    user?: { id: string; name?: string | null; email?: string | null };
+    expires_in?: number; ephemeral_hours?: number };
+  const loginHref = $derived(`/auth/login?${new URLSearchParams({ return_to: returnPath })}`);
   let sessionReady = $state(false),
     checking = $state(true),
     error = $state(""),
@@ -43,10 +54,14 @@
     pairs: { id: string; other_id: string; similarity: number }[];
   } | null>(null);
   let query = $state(""),
-    searchMode = $state<"name" | "text" | "hybrid">("name"),
+    searchMode = $state<"name" | "text" | "exact" | "hybrid">("name"),
     searching = $state(false),
     results = $state<Hit[] | null>(null),
     retrievalMode = $state("");
+  let nextOffset = $state<number | null>(null), searchTotal = $state<number | null>(null);
+  let chatDocument = $state<Document | null>(null);
+  let turns = $state<{ question: string; answer: string; sources: Source[] }[]>([]);
+  let lastQuestion = $state(""), completedAnswer = $state(false);
   let filter = $state("all"),
     dark = $state(false),
     dragging = $state(false);
@@ -61,6 +76,12 @@
   let chatController: AbortController | undefined;
   let searchTimer: ReturnType<typeof setTimeout>;
   let lastRequest = 0;
+  let navigationRequest = 0;
+  // Every asynchronous result belongs to the session that started it.
+  let sessionEpoch = 0;
+  const uploadControllers = new Set<AbortController>();
+  let readerElement = $state<HTMLDivElement>();
+  let returnFocus: HTMLElement | null = null;
   let visible = $derived(
     catalog.items.filter(
       (d) =>
@@ -70,11 +91,93 @@
           : d.status === "failed"),
     ),
   );
-  function handleError(e: unknown) {
-    if (e instanceof ApiError && e.status === 401) sessionReady = false;
+  function currentSession(epoch: number) {
+    return epoch === sessionEpoch && sessionReady && !leaving;
+  }
+  function handleError(e: unknown, epoch = sessionEpoch) {
+    if (epoch !== sessionEpoch || (e as Error).name === "AbortError") return;
+    if (e instanceof ApiError && e.status === 401) {
+      sessionReady = false;
+      user = null;
+      clearPrivateState();
+      checking = false;
+      leaving = false;
+    }
     error = (e as Error).message;
   }
-  async function load(more = false) {
+  function invalidateRequests() {
+    ++sessionEpoch;
+    clearTimeout(searchTimer);
+    searchController?.abort();
+    searchController = undefined;
+    chatController?.abort();
+    chatController = undefined;
+    for (const controller of uploadControllers) controller.abort();
+    uploadControllers.clear();
+    ++lastRequest;
+    ++navigationRequest;
+    verifyingSession = false;
+    searching = false;
+    asking = false;
+    comparing = false;
+    savingPreference = false;
+  }
+  function clearPrivateState() {
+    invalidateRequests();
+    locationReady = false;
+    selected = null;
+    page = 1;
+    panel = "info";
+    returnFocus = null;
+    chatDocument = null;
+    turns = [];
+    answer = "";
+    question = "";
+    sources = [];
+    comparison = null;
+    results = null;
+    query = "";
+    picked = [];
+    extraDocs = [];
+    uploads = [];
+    lastQuestion = "";
+    completedAnswer = false;
+    chatError = "";
+    feedback = null;
+    nextOffset = null;
+    searchTotal = null;
+    retrievalMode = "";
+    notice = "";
+    measurement = false;
+    measurementAvailable = false;
+    setMeasurement(false);
+    catalog = {items: [], next: null, stats: {total: 0, pending: 0, bytes: 0}};
+  }
+  $effect(() => {
+    if (!sessionReady || !locationReady) return;
+    const destination = readerDestination(window.location.href, selected?.id ?? null, page, panel);
+    window.history.replaceState(window.history.state, "", destination);
+    returnPath = destination;
+  });
+  async function verifySession() {
+    if (!sessionReady || checking || verifyingSession || leaving) return;
+    const epoch = sessionEpoch;
+    verifyingSession = true;
+    try {
+      const current = await request<Session>("/session/me");
+      if (!currentSession(epoch)) return;
+      if (current.mode !== accessMode || current.user?.id !== user?.id) {
+        await startSession();
+      } else {
+        user = current.user ?? null;
+        accountUrl = current.account_url ?? accountUrl;
+      }
+    } catch (e) { handleError(e, epoch); }
+    finally { if (epoch === sessionEpoch) verifyingSession = false; }
+  }
+  async function load(more = false, refresh = false) {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
     const id = ++lastRequest;
     const params = new URLSearchParams({
       q: searchMode === "name" ? query : "",
@@ -86,8 +189,19 @@
     }
     try {
       const data = await request<Catalog>(`/api/documents?${params}`);
-      if (id !== lastRequest) return;
-      catalog = more
+      if (!currentSession(epoch) || id !== lastRequest) return;
+      if (refresh) {
+        const fresh = new Map(data.items.map((doc) => [doc.id, doc]));
+        const pending = catalog.items.filter((doc) => !fresh.has(doc.id) && (doc.status !== "ready" || doc.summary_requested));
+        const updated = await Promise.all(pending.map((doc) => request<Document>(`/api/documents/${doc.id}`)));
+        if (!currentSession(epoch) || id !== lastRequest) return;
+        for (const doc of updated) fresh.set(doc.id, doc);
+        const known = new Set(catalog.items.map((doc) => doc.id));
+        catalog = { ...data, next: catalog.next, items: [
+          ...data.items.filter((doc) => !known.has(doc.id)),
+          ...catalog.items.map((doc) => fresh.get(doc.id) ?? doc),
+        ] };
+      } else catalog = more
         ? { ...data, items: [...catalog.items, ...data.items] }
         : data;
       if (selected) {
@@ -95,14 +209,27 @@
         const detail =
           data.items.find((d) => d.id === selectedId) ??
           (await request<Document>(`/api/documents/${selectedId}`));
+        if (!currentSession(epoch) || id !== lastRequest) return;
         if (selected?.id === selectedId) selected = detail;
+        if (chatDocument?.id === selectedId) chatDocument = detail;
+      }
+      if (chatDocument && chatDocument.id !== selected?.id) {
+        const contextId = chatDocument.id;
+        const detail = data.items.find((d) => d.id === contextId) ??
+          (chatDocument.status !== "ready" ? await request<Document>(`/api/documents/${contextId}`) : null);
+        if (currentSession(epoch) && id === lastRequest && detail && chatDocument?.id === contextId) chatDocument = detail;
       }
     } catch (e) {
-      handleError(e);
+      if (id === lastRequest) handleError(e, epoch);
     }
   }
-  async function doSearch() {
+  async function doSearch(more = false) {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
+    clearTimeout(searchTimer);
     searchController?.abort();
+    searching = false;
+    if (!more) { nextOffset = null; searchTotal = null; results = null; }
     error = "";
     if (searchMode === "name" || !query.trim()) {
       results = null;
@@ -113,28 +240,43 @@
     searchController = controller;
     searching = true;
     try {
-      const data = await request<{ items: Hit[]; mode: string }>(
-        `/api/search?${new URLSearchParams({ q: query, semantic: String(searchMode === "hybrid") })}`,
+      const data = await request<{ items: Hit[]; mode: string; next_offset?: number | null; total?: number }>(
+        `/api/search?${new URLSearchParams({ q: query, semantic: String(searchMode === "hybrid"), exact: String(searchMode === "exact"), limit: "20", offset: String(more ? nextOffset ?? 0 : 0) })}`,
         { signal: controller.signal },
       );
-      if (!controller.signal.aborted) {
-        results = data.items;
+      if (currentSession(epoch) && !controller.signal.aborted && searchController === controller) {
+        results = more ? [...(results ?? []), ...data.items] : data.items;
         retrievalMode = data.mode;
+        nextOffset = data.next_offset ?? null;
+        searchTotal = data.total ?? null;
       }
     } catch (e) {
-      if ((e as Error).name !== "AbortError") handleError(e);
+      if (searchController === controller) handleError(e, epoch);
     } finally {
-      if (searchController === controller) searching = false;
+      if (currentSession(epoch) && searchController === controller) searching = false;
     }
   }
   function scheduleSearch() {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
     clearTimeout(searchTimer);
     searchController?.abort();
-    searchTimer = setTimeout(doSearch, 300);
+    results = null;
+    nextOffset = null;
+    searchTimer = setTimeout(() => { if (currentSession(epoch)) void doSearch(); }, 300);
   }
   async function openDocument(doc: Document, at = 1) {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
+    const navigation = ++navigationRequest;
+    if (!selected) returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     chatController?.abort();
+    chatController = undefined;
     selected = doc;
+    chatDocument = doc;
+    turns = [];
+    lastQuestion = "";
+    completedAnswer = false;
     page = at;
     panel = "info";
     answer = "";
@@ -144,24 +286,42 @@
     question = "";
     extraDocs = [];
     asking = false;
+    await tick();
+    if (currentSession(epoch) && navigation === navigationRequest) readerElement?.focus();
   }
   async function openHit(hit: Hit) {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
+    const navigation = ++navigationRequest;
     try {
-      await openDocument(
-        await request<Document>(`/api/documents/${hit.id}`),
-        hit.page,
-      );
+      const doc = await request<Document>(`/api/documents/${hit.id}`);
+      if (currentSession(epoch) && navigation === navigationRequest) await openDocument(doc, hit.page);
     } catch (e) {
-      handleError(e);
+      if (navigation === navigationRequest) handleError(e, epoch);
     }
   }
+  async function closeReader() {
+    const epoch = sessionEpoch;
+    const navigation = ++navigationRequest;
+    selected = null;
+    chatController?.abort();
+    chatController = undefined;
+    asking = false;
+    await tick();
+    if (currentSession(epoch) && navigation === navigationRequest && returnFocus?.isConnected) returnFocus.focus();
+  }
   async function addFiles(files: FileList | File[]) {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
+    const controller = new AbortController();
+    uploadControllers.add(controller);
+    const active = () => currentSession(epoch) && !controller.signal.aborted;
     error = "";
     notice = "";
     // Two concurrent transfers at most, independent of OCR/LLM work.
     const queue = Array.from(files);
     const consume = async () => {
-      while (queue.length) {
+      while (active() && queue.length) {
         const file = queue.shift()!;
         const item = { name: file.name, progress: 0, state: "Subiendo" };
         const index = uploads.length;
@@ -175,8 +335,9 @@
         }
         try {
           const data = await uploadFile(file, (n) => {
-            uploads[index].progress = n;
-          });
+            if (active()) uploads[index].progress = n;
+          }, controller.signal);
+          if (!active()) return;
           uploads[index].progress = 100;
           uploads[index].state = data.duplicate
             ? "Ya estaba en tu biblioteca"
@@ -185,58 +346,90 @@
             "Tus archivos guardados ya se pueden abrir. El texto se procesará en segundo plano.";
           await load();
         } catch (e) {
+          if (!active() || (e as Error).name === "AbortError") return;
+          if (e instanceof ApiError && e.status === 401) {
+            handleError(e, epoch);
+            return;
+          }
           uploads[index].state = (e as Error).message;
         }
       }
     };
-    await Promise.all([consume(), consume()]);
-    fileInput.value = "";
+    try {
+      await Promise.all([consume(), consume()]);
+      if (active() && fileInput) fileInput.value = "";
+    } finally {
+      uploadControllers.delete(controller);
+    }
   }
   async function retry(doc: Document) {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
     try {
       await request(`/api/documents/${doc.id}/retry`, { method: "POST" });
-      await load();
+      if (currentSession(epoch)) await load();
     } catch (e) {
-      handleError(e);
+      handleError(e, epoch);
     }
   }
   async function openSource(source: Source) {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch)) return;
     track("citation_open");
+    const navigation = ++navigationRequest;
     if (selected?.id === source.id) page = source.page;
     else
       try {
-        await openDocument(
-          await request<Document>(`/api/documents/${source.id}`),
-          source.page,
-        );
+        const doc = await request<Document>(`/api/documents/${source.id}`);
+        if (!currentSession(epoch) || navigation !== navigationRequest || !selected) return;
+        selected = doc;
+        page = source.page;
+        panel = "chat";
       } catch (e) {
-        handleError(e);
+        if (navigation === navigationRequest) handleError(e, epoch);
       }
   }
+  function resetChat() {
+    ++navigationRequest;
+    chatController?.abort();
+    chatController = undefined;
+    asking = false;
+    answer = "";
+    sources = [];
+    turns = [];
+    lastQuestion = "";
+    completedAnswer = false;
+    chatError = "";
+    feedback = null;
+  }
   async function generateSummary() {
-    if (!selected) return;
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch) || !selected) return;
     try {
       await request(`/api/documents/${selected.id}/summary`, {
         method: "POST",
       });
-      await load();
+      if (currentSession(epoch)) await load();
     } catch (e) {
-      handleError(e);
+      handleError(e, epoch);
     }
   }
   async function compare() {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch) || comparing) return;
     comparing = true;
     error = "";
     try {
-      comparison = await request("/api/similarity", {
+      const data = await request<NonNullable<typeof comparison>>("/api/similarity", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ document_ids: picked }),
       });
+      if (currentSession(epoch)) comparison = data;
     } catch (e) {
-      handleError(e);
+      handleError(e, epoch);
     } finally {
-      comparing = false;
+      if (currentSession(epoch)) comparing = false;
     }
   }
   function similarity(a: string, b: string) {
@@ -246,36 +439,29 @@
     );
   }
   async function startSession(create = false) {
+    if (leaving) return;
+    // Stop the previous session before resolving a fresh identity. Keep its URL
+    // so an expired session can return to the same document after signing in.
+    sessionReady = false;
+    user = null;
+    clearPrivateState();
+    const epoch = sessionEpoch;
     if (create) {
-      searchController?.abort();
-      chatController?.abort();
-      ++lastRequest;
-      selected = null;
-      answer = "";
-      question = "";
-      sources = [];
-      comparison = null;
-      results = null;
-      query = "";
-      picked = [];
-      extraDocs = [];
-      uploads = [];
-      catalog = {items: [], next: null, stats: {total: 0, pending: 0, bytes: 0}};
+      window.history.replaceState(window.history.state, "", readerDestination(window.location.href, null, 1, "info"));
+      returnPath = window.location.pathname + window.location.search + window.location.hash;
     }
     checking = true;
     error = "";
     try {
-      const session = await request<{
-        mode: string;
-        login_available: boolean;
-        expires_in?: number;
-        ephemeral_hours?: number;
-      }>(
+      const session = await request<Session>(
         create ? "/session/anonymous" : "/session/me",
         create ? { method: "POST" } : {},
       );
+      if (epoch !== sessionEpoch) return;
       accessMode = session.mode;
       loginAvailable = session.login_available;
+      accountUrl = session.account_url ?? "";
+      user = session.user ?? null;
       expiresIn = session.expires_in ?? (session.ephemeral_hours ?? 24) * 3600;
       sessionReady = session.mode !== "choose";
       if (!sessionReady) {
@@ -283,40 +469,68 @@
         return;
       }
       await load();
+      if (!currentSession(epoch)) return;
+      if (!locationReady) {
+        const destination = readerLocation(window.location.href);
+        if (destination) {
+          const navigation = ++navigationRequest;
+          try {
+            const doc = await request<Document>(`/api/documents/${destination.id}`);
+            if (!currentSession(epoch) || navigation !== navigationRequest) return;
+            await openDocument(doc, Math.min(destination.page, doc.page_count || 1));
+            if (!currentSession(epoch) || selected?.id !== doc.id) return;
+            panel = destination.panel;
+          } catch (e) { if (navigation === navigationRequest) handleError(e, epoch); }
+        }
+        if (!currentSession(epoch)) return;
+        locationReady = true;
+      }
+      if (!currentSession(epoch)) return;
       try {
         const prefs = await request<{
           enabled: boolean;
           available: boolean;
           retention_days: number;
         }>("/api/analytics/preferences");
+        if (!currentSession(epoch)) return;
         measurement = prefs.enabled;
         measurementAvailable = prefs.available;
         retentionDays = prefs.retention_days;
         setMeasurement(measurement);
         track("library_view");
-      } catch {
+      } catch (e) {
+        if (!currentSession(epoch)) return;
         setMeasurement(false);
         measurement = false;
+        if (e instanceof ApiError && e.status === 401) handleError(e, epoch);
       }
     } catch (e) {
-      handleError(e);
+      handleError(e, epoch);
     } finally {
-      checking = false;
+      if (epoch === sessionEpoch) checking = false;
     }
   }
   async function endSession() {
+    if (!sessionReady || leaving) return;
+    invalidateRequests();
+    const epoch = sessionEpoch;
     leaving = true;
     try {
       await request("/session/end", { method: "POST" });
-      setMeasurement(false);
+      if (epoch !== sessionEpoch) return;
+      sessionReady = false;
+      user = null;
+      clearPrivateState();
       window.location.reload();
     } catch (e) {
-      handleError(e);
+      handleError(e, epoch);
     } finally {
-      leaving = false;
+      if (epoch === sessionEpoch) leaving = false;
     }
   }
   async function changeMeasurement() {
+    const epoch = sessionEpoch;
+    if (!currentSession(epoch) || savingPreference) return;
     savingPreference = true;
     try {
       const pref = await request<{ enabled: boolean }>(
@@ -327,12 +541,13 @@
           body: JSON.stringify({ enabled: !measurement }),
         },
       );
+      if (!currentSession(epoch)) return;
       measurement = pref.enabled;
       setMeasurement(measurement);
     } catch (e) {
-      handleError(e);
+      handleError(e, epoch);
     } finally {
-      savingPreference = false;
+      if (currentSession(epoch)) savingPreference = false;
     }
   }
   function rateAnswer(value: "positive" | "negative") {
@@ -341,10 +556,21 @@
     track("answer_feedback", value);
   }
   async function ask() {
-    if (!selected || !question.trim() || asking) return;
+    const epoch = sessionEpoch;
+    const context = chatDocument ?? selected;
+    if (!currentSession(epoch) || !context || !question.trim() || asking) return;
     const controller = new AbortController();
     chatController = controller;
     asking = true;
+    if (completedAnswer && answer && !chatError) {
+      turns = [...turns, { question: lastQuestion, answer, sources: [...sources] }].slice(-6);
+    }
+    const history = turns.flatMap((turn) => [
+      {role: "user", content: turn.question.slice(0, 4000)},
+      {role: "assistant", content: turn.answer.slice(0, 4000)},
+    ]);
+    lastQuestion = question.trim();
+    completedAnswer = false;
     answer = "";
     feedback = null;
     sources = [];
@@ -354,15 +580,17 @@
         method: "POST",
         headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf() },
         body: JSON.stringify({
-          question,
-          document_ids: [selected.id, ...extraDocs],
+          question: lastQuestion,
+          document_ids: [context.id, ...extraDocs],
+          history,
         }),
         signal: controller.signal,
       });
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.detail || "No se pudo iniciar la consulta.");
+        const data = await response.json().catch(() => ({}));
+        throw new ApiError(response.status, data.detail || "No se pudo iniciar la consulta.");
       }
+      if (!currentSession(epoch) || controller.signal.aborted || chatController !== controller) return;
       const reader = response.body!.getReader(),
         decoder = new TextDecoder();
       let pending = "";
@@ -376,16 +604,25 @@
           pending = pending.slice(boundary + 2);
           if (event.startsWith("data: ")) {
             const data = JSON.parse(event.slice(6));
+            if (!currentSession(epoch) || controller.signal.aborted || chatController !== controller) return;
             if (data.token) answer += data.token;
             if (data.sources) sources = data.sources;
             if (data.error) chatError = data.error;
+            if (data.done) completedAnswer = true;
           }
         }
       }
+      if (!currentSession(epoch) || controller.signal.aborted || chatController !== controller) return;
+      if (!completedAnswer && !chatError)
+        chatError = "La respuesta se interrumpió. Puedes volver a consultar.";
+      if (completedAnswer && !chatError && question.trim() === lastQuestion) question = "";
     } catch (e) {
-      if ((e as Error).name !== "AbortError") chatError = (e as Error).message;
+      if (currentSession(epoch) && chatController === controller && (e as Error).name !== "AbortError") {
+        if (e instanceof ApiError && e.status === 401) handleError(e, epoch);
+        else chatError = (e as Error).message;
+      }
     } finally {
-      if (chatController === controller) asking = false;
+      if (currentSession(epoch) && chatController === controller) asking = false;
     }
   }
   function toggleTheme() {
@@ -395,26 +632,31 @@
     track("theme_changed", dark ? "dark" : "light");
   }
   onMount(() => {
+    returnPath = window.location.pathname + window.location.search + window.location.hash;
     dark =
       localStorage.getItem("sara-theme") === "dark" ||
       (!localStorage.getItem("sara-theme") &&
         matchMedia("(prefers-color-scheme: dark)").matches);
     document.documentElement.dataset.saraTheme = dark ? "dark" : "light";
     void startSession();
+    const onVisible = () => { if (!document.hidden) void verifySession(); };
+    document.addEventListener("visibilitychange", onVisible);
+    const sessionPoll = setInterval(onVisible, 60000);
     const poll = setInterval(() => {
       if (
         sessionReady &&
-        catalog.stats.pending > 0 &&
-        !query &&
+        !checking && !leaving &&
+        (catalog.stats.pending > 0 || selected?.summary_requested) &&
         !document.hidden
       )
-        void load();
+        void load(false, true);
     }, 4000);
     return () => {
       clearInterval(poll);
-      clearTimeout(searchTimer);
-      searchController?.abort();
-      chatController?.abort();
+      clearInterval(sessionPoll);
+      document.removeEventListener("visibilitychange", onVisible);
+      sessionReady = false;
+      invalidateRequests();
     };
   });
 </script>
@@ -426,7 +668,7 @@
   /></svelte:head
 >
 <a class="skip-link" href="#main">Saltar al contenido</a>
-<div class="app-shell">
+<div class="app-shell" inert={selected !== null}>
   <aside class="sidebar">
     <a href="/" class="brand" aria-label="SARA DocReader, inicio"
       ><img
@@ -448,7 +690,9 @@
         onclick={() => {
           filter = "all";
           selected = null;
-          void load();
+          query = "";
+          results = null;
+          void doSearch();
         }}><span>▤</span> Mi biblioteca <b>{catalog.stats.total}</b></button
       >
       <button
@@ -457,7 +701,9 @@
         onclick={() => {
           filter = "pending";
           selected = null;
-          void load();
+          query = "";
+          results = null;
+          void doSearch();
         }}
         ><span>◷</span> En procesamiento <b>{catalog.stats.pending}</b></button
       >
@@ -467,7 +713,9 @@
         onclick={() => {
           filter = "failed";
           selected = null;
-          void load();
+          query = "";
+          results = null;
+          void doSearch();
         }}><span>!</span> Por revisar</button
       >
     </nav>
@@ -486,17 +734,20 @@
       <span>Laboratorio <span class="slash">/</span> DocReader</span><span
         class="private-badge"
         >◉ {accessMode === "account"
-          ? "Con cuenta"
+          ? user?.name || user?.email || "Cuenta SARA"
           : sessionReady
             ? "Sin cuenta"
             : "Elige tu acceso"}</span
       >
+      {#if accessMode === "account" && sessionReady && accountUrl}
+        <a class="quiet account-link" href={accountUrl} target="_blank" rel="noopener noreferrer">Mi cuenta SARA ↗</a>
+      {/if}
       {#if sessionReady}<button
           class="quiet"
           disabled={leaving}
           onclick={endSession}
           >{accessMode === "account"
-            ? "Cerrar sesión"
+            ? "Salir de SmartDoc"
             : accessMode === "ephemeral"
               ? "Terminar y borrar espacio"
               : "Salir del espacio"}</button
@@ -506,7 +757,7 @@
       {#if checking}<div class="empty">
           <span class="eyebrow">SARA DOCREADER</span>
           <h1>Abriendo tu biblioteca…</h1>
-          <p role="status">Preparando tu espacio, sin registro.</p>
+          <p role="status">Comprobando tu acceso y preparando tu espacio.</p>
         </div>
       {:else if !sessionReady}
         <section class="welcome">
@@ -528,11 +779,12 @@
               >
             </article>
             <article>
-              <h2>Con tu cuenta</h2>
+              <h2>Con tu cuenta SARA</h2>
               <p>
-                Conserva tu biblioteca y vuelve a ella desde otros dispositivos.
+                Usa la misma cuenta que en SARA y SaraPad. Conserva tu biblioteca
+                y vuelve a ella desde otros dispositivos.
               </p>
-              {#if loginAvailable}<a class="primary" href="/auth/login"
+              {#if loginAvailable}<a class="primary" href={loginHref}
                   >Iniciar sesión →</a
                 >
               {:else}<button class="secondary" disabled
@@ -556,7 +808,7 @@
                   ? "Documentos por revisar"
                   : "Mi biblioteca"}
             </h1>
-            <p>Abre, busca y consulta tus documentos. Sin registro.</p>
+            <p>Abre, busca y consulta tus documentos con fuentes por página.</p>
           </div>
           <button class="primary" onclick={() => fileInput.click()}
             >＋ Subir documentos</button
@@ -584,6 +836,7 @@
         <div class="searchbar">
           <span aria-hidden="true">⌕</span><input
             aria-label="Buscar documentos"
+            maxlength="300"
             placeholder={searchMode === "name"
               ? "Buscar por nombre del documento…"
               : "¿Qué quieres encontrar en tus documentos?"}
@@ -598,7 +851,7 @@
             }}
             ><option value="name">Por nombre</option><option value="text"
               >Por contenido</option
-            ><option value="hybrid">Por significado</option></select
+            ><option value="exact">Frase exacta</option><option value="hybrid">Por significado</option></select
           >{#if query}<button
               class="icon-button"
               aria-label="Limpiar búsqueda"
@@ -608,6 +861,7 @@
               }}>×</button
             >{/if}
         </div>
+        {#if searchMode === "exact"}<p class="search-help">Encuentra una palabra, frase o referencia literal en todas las páginas indexadas. No distingue mayúsculas.</p>{/if}
         {#if notice}<p class="notice" role="status">✓ {notice}</p>{/if}
         {#if uploads.length}<section
             class="upload-list"
@@ -629,7 +883,7 @@
         {#if results !== null}
           <div class="section-heading">
             <h2>Resultados en el contenido</h2>
-            <span>{results.length} fragmentos</span>
+            <span role="status">{results.length}{searchTotal !== null ? ` de ${searchTotal}` : ""} {retrievalMode === "exact" ? "páginas" : "fragmentos"}</span>
           </div>
           {#if retrievalMode === "text_fallback"}<p class="notice">
               La búsqueda semántica no está disponible. Mostramos coincidencias
@@ -648,13 +902,12 @@
                 onclick={() => openHit(hit)}
                 ><span class="eyebrow">{hit.name} · PÁGINA {hit.page}</span>
                 <p>
-                  {hit.content.slice(0, 450)}{hit.content.length > 450
-                    ? "…"
-                    : ""}
+                  {#each excerpt(hit.content, query) as part}{#if part.match}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}
                 </p>
                 <span class="text-link">Leer en el documento →</span></button
               >{/each}
           </div>
+          {#if nextOffset !== null}<button class="secondary" disabled={searching} onclick={() => doSearch(true)}>Cargar más coincidencias</button>{/if}
         {:else}
           <div class="section-heading">
             <h2>{query ? "Documentos encontrados" : "Tus documentos"}</h2>
@@ -855,15 +1108,12 @@
     </main>
   </div>
 </div>
-{#if selected}
-  <div class="reader-shell">
+{#if selected && sessionReady}
+  <div class="reader-shell" bind:this={readerElement} role="dialog" aria-modal="true" aria-label={`Lector de ${selected.name}`} tabindex="-1" onkeydown={(event) => { if (event.key === "Escape") closeReader(); }}>
     <header class="reader-heading">
       <button
         class="secondary"
-        onclick={() => {
-          selected = null;
-          chatController?.abort();
-        }}>← Biblioteca</button
+        onclick={closeReader}>← Biblioteca</button
       ><strong>{selected.name}</strong><span class={`status ${selected.status}`}
         >{states[selected.status]}</span
       >
@@ -897,14 +1147,14 @@
           </dl>
           {#if selected.summary}<h3>Síntesis del documento</h3>
             <div class="answer">
-              {selected.summary}
+              <Answer text={selected.summary} />
             </div>{/if}{#if selected.summary_error}<p class="error">
               {selected.summary_error}
             </p>{/if}<button
             class="secondary"
-            disabled={selected.status !== "ready"}
+            disabled={selected.status !== "ready" || selected.summary_requested}
             onclick={generateSummary}
-            >{selected.summary
+            >{selected.summary_requested ? "Preparando síntesis…" : selected.summary
               ? "Actualizar síntesis"
               : "Generar síntesis y categoría"}</button
           >
@@ -927,24 +1177,30 @@
           >
         {:else}<span class="eyebrow">CONSULTA CON FUENTES</span>
           <h2>Pregúntale al documento</h2>
+          <p class="context-label">Conversación sobre <strong>{(chatDocument ?? selected).name}</strong></p>
+          {#if chatDocument && selected.id !== chatDocument.id}<button class="secondary" onclick={() => { ++navigationRequest; selected = chatDocument; page = 1; }}>Volver al documento de la conversación</button>{/if}
           <p>
             Las respuestas se apoyan en fragmentos del archivo. Revisa siempre
             la fuente.
           </p>
           <details class="extra-documents">
             <summary>Incluir otros documentos ({extraDocs.length})</summary
-            >{#each catalog.items.filter((d) => d.id !== selected?.id && d.status === "ready") as doc}<label
+            >{#each catalog.items.filter((d) => d.id !== (chatDocument ?? selected)?.id && d.status === "ready") as doc}<label
                 ><input
                   type="checkbox"
                   value={doc.id}
                   bind:group={extraDocs}
-                  disabled={!extraDocs.includes(doc.id) &&
-                    extraDocs.length >= 19}
+                  onchange={resetChat}
+                  disabled={asking || (!extraDocs.includes(doc.id) &&
+                    extraDocs.length >= 19)}
                 />{doc.name}</label
               >{/each}<small
-              >Documentos disponibles en la lista cargada de tu biblioteca.</small
+              >Cambiar los documentos inicia una conversación nueva. Se muestran los documentos cargados de tu biblioteca.</small
             >
+            {#if catalog.next}<button class="secondary" disabled={asking} onclick={() => load(true)}>Cargar más documentos</button>{/if}
           </details>
+          {#if turns.length || answer}<button class="quiet" disabled={asking} onclick={resetChat}>Nueva conversación</button>{/if}
+          {#each turns as turn}<details class="chat-turn"><summary>{turn.question}</summary><div class="answer"><Answer text={turn.answer} sources={turn.sources} onsource={openSource} /></div>{#each turn.sources as source, i}<button class="source" onclick={() => openSource(source)}>Fuente {i + 1} · {source.name} · Página {source.page}</button>{/each}</details>{/each}
           <form
             onsubmit={(e) => {
               e.preventDefault();
@@ -953,27 +1209,27 @@
           >
             <label for="question">Tu pregunta</label><textarea
               id="question"
-              placeholder="¿Qué metodología se utilizó?"
+              placeholder={completedAnswer || turns.length ? "Continúa la conversación…" : "¿Qué metodología se utilizó?"}
               bind:value={question}
               maxlength="2000"
               rows="4"></textarea><button
               class="primary"
               disabled={asking ||
-                selected.status !== "ready" ||
+                (chatDocument ?? selected).status !== "ready" ||
                 !question.trim()}
               >{asking ? "Consultando…" : "Consultar documento →"}</button
             >{#if asking}<button
                 type="button"
                 class="quiet"
-                onclick={() => chatController?.abort()}>Detener</button
+                onclick={() => { chatController?.abort(); chatError = "Consulta detenida. Puedes reformular la pregunta."; }}>Detener</button
               >{/if}
           </form>
           {#if selected.status !== "ready"}<p class="notice">
               Podrás consultar cuando termine el procesamiento.
             </p>{/if}{#if chatError}<p class="error" role="alert">
               {chatError}
-            </p>{/if}{#if answer}<div class="answer">
-              {answer}
+            </p>{/if}{#if answer}<h3>{lastQuestion}</h3><div class="answer">
+              <Answer text={answer} {sources} onsource={openSource} />
             </div>
             <div class="answer-feedback">
               <span>¿Te resultó útil?</span><button

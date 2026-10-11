@@ -8,7 +8,7 @@ type EventName =
   | "search_mode_changed"
   | "answer_feedback";
 type EventValue =
-  "light" | "dark" | "name" | "text" | "hybrid" | "positive" | "negative";
+  "light" | "dark" | "name" | "text" | "exact" | "hybrid" | "positive" | "negative";
 let active = false;
 export function setMeasurement(enabled: boolean) {
   active = enabled;

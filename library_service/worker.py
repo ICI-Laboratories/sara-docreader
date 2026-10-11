@@ -11,6 +11,7 @@ from uuid import uuid4
 from .db import make_pool, original
 from .search import embed, embedding_identity, model_name, vector_literal
 from .ocr import extract_page, ocr_model
+from .text import page_records
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +50,11 @@ def extract(path):
                 else:
                     tp = page.get_textpage_ocr(language='spa+eng', dpi=150, full=not text.strip())
                     text = page.get_text(textpage=tp, sort=True)
-            for part in split_text(text):
-                chunks.append({'page': index + 1, 'content': part})
+            for number, part in enumerate(split_text(text)):
+                chunk = {'page': index + 1, 'content': part}
+                if number == 0:
+                    chunk['page_text'] = text.replace('\x00', '').strip()
+                chunks.append(chunk)
         pages = len(pdf)
     if not chunks:
         raise ValueError('No se encontró texto legible en el documento.')
@@ -68,9 +72,13 @@ def process_child(path, output, summary_requested=False, cached_input=None):
             model, embedding_error = None, None
         if model_name() and not cached:
             try:
+                deadline = time.monotonic() + max(1, int(os.environ.get('SARA_EMBEDDING_BUDGET_SECONDS', '180')))
                 for offset in range(0, len(chunks), 16):
                     batch = chunks[offset:offset + 16]
-                    vectors = embed([c['content'] for c in batch], timeout=60)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('Se agotó el presupuesto de embeddings.')
+                    vectors = embed([c['content'] for c in batch], timeout=min(60, remaining))
                     for chunk, vector in zip(batch, vectors):
                         chunk['embedding'] = vector
                 model = embedding_identity()
@@ -133,10 +141,13 @@ def _finish(pool, job, result):
             conn.execute('UPDATE documents SET status=%s,error=%s WHERE id=%s', (state, result['error'], job['document_id']))
             return True
         conn.execute('DELETE FROM chunks WHERE document_id=%s', (job['document_id'],))
+        conn.execute('DELETE FROM document_pages WHERE document_id=%s', (job['document_id'],))
         with conn.cursor() as cursor:
             cursor.executemany('INSERT INTO chunks(document_id,ordinal,page,content,embedding) VALUES (%s,%s,%s,%s,%s::vector)',
                 [(job['document_id'], i, c['page'], c['content'], vector_literal(c['embedding']) if c.get('embedding') else None)
                  for i, c in enumerate(result['chunks'])])
+            cursor.executemany('INSERT INTO document_pages(document_id,page,content) VALUES (%s,%s,%s)',
+                               [(job['document_id'], page, content) for page, content in page_records(result['chunks'])])
         conn.execute("""UPDATE documents SET status='ready',page_count=%s,error=NULL,
             embedding_model=%s,embedding_error=%s,summary=coalesce(%s,summary),
             category=coalesce(%s,category),summary_error=%s,summary_requested=false WHERE id=%s""",
@@ -169,11 +180,15 @@ def run_job(pool, job):
             with pool.connection() as conn:
                 doc = conn.execute('SELECT page_count,embedding_model,embedding_error FROM documents WHERE id=%s', (job['document_id'],)).fetchone()
                 chunks = conn.execute('SELECT page,content,embedding::text AS vector FROM chunks WHERE document_id=%s ORDER BY ordinal', (job['document_id'],)).fetchall()
+                page_texts = {row['page']: row['content'] for row in conn.execute(
+                    'SELECT page,content FROM document_pages WHERE document_id=%s', (job['document_id'],)).fetchall()}
             if chunks:
                 for chunk in chunks:
                     vector = chunk.pop('vector')
                     if vector:
                         chunk['embedding'] = json.loads(vector)
+                    if chunk['page'] in page_texts:
+                        chunk['page_text'] = page_texts.pop(chunk['page'])
                 cached_input = str(Path(tmp) / 'input.json')
                 Path(cached_input).write_text(json.dumps({'pages': doc['page_count'], 'chunks': chunks,
                     'model': doc['embedding_model'], 'embedding_error': doc['embedding_error']}))

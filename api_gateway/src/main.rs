@@ -157,6 +157,7 @@ struct CentralSession {
 struct OAuthTransaction {
     verifier_hash: String,
     expires_at: Instant,
+    return_url: Url,
 }
 
 #[derive(Clone)]
@@ -172,12 +173,18 @@ struct AppState {
 #[derive(Clone, Debug, Serialize)]
 struct Principal {
     subject: String,
+    name: Option<String>,
+    email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CentralPrincipal {
     id: String,
     is_active: bool,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +201,11 @@ struct CentralTokenResponse {
 struct CallbackQuery {
     code: String,
     state: String,
+}
+
+#[derive(Default, Deserialize)]
+struct LoginQuery {
+    return_to: Option<String>,
 }
 
 #[derive(Debug)]
@@ -358,9 +370,9 @@ async fn anonymous_session_handler(State(state): State<AppState>, headers: Heade
     }
 }
 
-async fn optional_login_handler(State(state): State<AppState>) -> Response {
+async fn optional_login_handler(State(state): State<AppState>, query: Query<LoginQuery>) -> Response {
     if !state.config.login_enabled { return no_store_json(StatusCode::SERVICE_UNAVAILABLE,json!({"error":"El portal de cuentas aún no está configurado."})); }
-    auth_login_handler(State(state)).await
+    auth_login_handler(State(state), query).await
 }
 
 async fn optional_callback_handler(State(state): State<AppState>, headers: HeaderMap, query: axum::extract::Query<CallbackQuery>) -> Response {
@@ -375,7 +387,7 @@ async fn access_session_handler(State(state): State<AppState>, headers: HeaderMa
     }
     let payload = if state.config.login_enabled && cookie_value(&headers,&state.config.session_cookie_name).is_some() {
         match authenticate_request(&state,&headers).await {
-            Ok(_) => json!({"mode":"account","anonymous":false,"login_available":true}),
+            Ok((_, principal)) => account_session_payload(&state.config, &principal),
             Err(SessionError::Unauthorized) => json!({"mode":"choose","ephemeral_hours":state.config.ephemeral_hours,"login_available":true}),
             Err(error) => return session_error_response(error),
         }
@@ -386,6 +398,8 @@ async fn access_session_handler(State(state): State<AppState>, headers: HeaderMa
             Err(status) => return anonymous_error(status),
         }
     };
+    let mut payload = payload;
+    payload["account_url"] = json!(account_portal_url(&state.config));
     let mut response=no_store_json(StatusCode::OK,payload);
     if cookie_value(&headers,&state.config.csrf_cookie_name).is_none() {
         let mut config=(*state.config).clone(); config.cookie_domain=None;
@@ -424,7 +438,7 @@ async fn require_anonymous_session(State(state): State<AppState>, mut req: Reque
     }
     match resolve_anonymous(&state,req.headers(),false).await {
         Ok(session) => {
-            req.extensions_mut().insert(Principal {subject: session.subject});
+            req.extensions_mut().insert(Principal {subject: session.subject, name: None, email: None});
             next.run(req).await
         }
         Err(status) => anonymous_error(status),
@@ -457,7 +471,38 @@ async fn health_handler() -> impl IntoResponse {
     no_store_json(StatusCode::OK, json!({"status": "ok"}))
 }
 
-async fn auth_login_handler(State(state): State<AppState>) -> Response {
+fn login_return_url(config: &Config, return_to: Option<&str>) -> Option<Url> {
+    let Some(return_to) = return_to else {
+        return Some(config.frontend_url.clone());
+    };
+    // Resolve once on entry, then keep the destination in the server-side PKCE
+    // transaction. Neither the portal nor callback parameters can replace it.
+    if return_to.is_empty() || return_to.len() > 4096 || return_to.trim() != return_to
+        || return_to.chars().any(|c| c.is_control() || c == '\\')
+        || return_to.starts_with("//") {
+        return None;
+    }
+    let url = if return_to.starts_with('/') {
+        config.frontend_url.join(return_to).ok()?
+    } else {
+        Url::parse(return_to).ok()?
+    };
+    if url.origin() != config.frontend_url.origin()
+        || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    // Only return to UI routes, not OAuth handlers or protected service routes.
+    if ["/auth", "/session", "/api", "/process_document", "/health", "/metrics"]
+        .iter().any(|prefix| url.path() == *prefix || url.path().starts_with(&format!("{prefix}/"))) {
+        return None;
+    }
+    Some(url)
+}
+
+async fn auth_login_handler(State(state): State<AppState>, Query(query): Query<LoginQuery>) -> Response {
+    let Some(return_url) = login_return_url(&state.config, query.return_to.as_deref()) else {
+        return no_store_json(StatusCode::BAD_REQUEST, json!({"error": "Destino de regreso no válido"}));
+    };
     if state.oauth_transactions.len() >= MAX_PENDING_OAUTH_TRANSACTIONS {
         let now = Instant::now();
         state
@@ -478,6 +523,7 @@ async fn auth_login_handler(State(state): State<AppState>) -> Response {
         OAuthTransaction {
             verifier_hash: session_key(&verifier),
             expires_at: Instant::now() + state.config.oauth_transaction_ttl,
+            return_url,
         },
     );
     let mut authorize_url = state.config.auth_portal_authorize_url.clone();
@@ -523,8 +569,8 @@ async fn auth_callback_handler(
     headers: HeaderMap,
 ) -> Response {
     match complete_callback(&state, &query, &headers).await {
-        Ok((session_cookie, csrf_token, refresh_ttl)) => {
-            let mut response = redirect_response(state.config.frontend_url.as_str());
+        Ok((session_cookie, csrf_token, refresh_ttl, return_url)) => {
+            let mut response = redirect_response(return_url.as_str());
             append_cookie(
                 &mut response,
                 &build_cookie(
@@ -566,7 +612,7 @@ async fn complete_callback(
     state: &AppState,
     query: &CallbackQuery,
     headers: &HeaderMap,
-) -> std::result::Result<(String, String, u64), StatusCode> {
+) -> std::result::Result<(String, String, u64, Url), StatusCode> {
     if query.code.len() < 20 || query.code.len() > 256 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -658,7 +704,7 @@ async fn complete_callback(
         .max(1);
     revoke_previous_browser_session(state, headers).await;
     state.sessions.insert(key, central_session);
-    Ok((raw_session, random_token(32), refresh_ttl))
+    Ok((raw_session, random_token(32), refresh_ttl, transaction.return_url))
 }
 
 async fn revoke_previous_browser_session(state: &AppState, headers: &HeaderMap) {
@@ -688,9 +734,28 @@ async fn revoke_central_refresh(state: &AppState, refresh_token: String) {
     }
 }
 
+fn account_portal_url(config: &Config) -> String {
+    let mut url = config.auth_portal_authorize_url.clone();
+    let base_path = url.path().rsplit_once('/').map(|(base, _)| base).unwrap_or("");
+    let account_path = format!("{base_path}/account");
+    url.set_path(&account_path);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn account_session_payload(config: &Config, principal: &Principal) -> serde_json::Value {
+    json!({
+        "mode": "account", "anonymous": false, "login_available": true,
+        "subject": principal.subject,
+        "account_url": account_portal_url(config),
+        "user": {"id": principal.subject, "name": principal.name, "email": principal.email},
+    })
+}
+
 async fn session_me_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match authenticate_request(&state, &headers).await {
-        Ok((_, principal)) => no_store_json(StatusCode::OK, json!(principal)),
+        Ok((_, principal)) => no_store_json(StatusCode::OK, account_session_payload(&state.config, &principal)),
         Err(error) => session_error_response(error),
     }
 }
@@ -854,6 +919,8 @@ async fn introspect_access_token(
     }
     Ok(Principal {
         subject: subject.to_string(),
+        name: central.name,
+        email: central.email,
     })
 }
 
@@ -1460,6 +1527,34 @@ mod tests {
         assert!(validate_cookie_scope(&callback, &frontend, Some(".unrelated.test")).is_err());
     }
 
+    #[test]
+    fn login_return_preserves_ui_location_and_rejects_untrusted_destinations() {
+        let mut config = Config::from_env().unwrap();
+        config.frontend_url = Url::parse("https://smartdoc.ici-labs.com/").unwrap();
+        config.auth_portal_authorize_url = Url::parse("https://auth.ici-labs.com/authorize").unwrap();
+        assert_eq!(account_portal_url(&config), "https://auth.ici-labs.com/account");
+        assert_eq!(login_return_url(&config, None).unwrap().as_str(), "https://smartdoc.ici-labs.com/");
+        for destination in [
+            "/library/book?view=reader&page=487#citation-23",
+            "https://smartdoc.ici-labs.com/library/book?view=reader&page=487#citation-23",
+        ] {
+            assert_eq!(login_return_url(&config, Some(destination)).unwrap().as_str(),
+                "https://smartdoc.ici-labs.com/library/book?view=reader&page=487#citation-23");
+        }
+        for destination in [
+            "", "library/book", "//evil.test/", "/\\evil.test/", "\\\\evil.test/",
+            "https://evil.test/", "https://smartdoc.ici-labs.com.evil.test/",
+            "https://smartdoc.ici-labs.com:444/", "http://smartdoc.ici-labs.com/",
+            "https://attacker@smartdoc.ici-labs.com/", "javascript:alert(1)",
+            " /library", "/library\r\nLocation: https://evil.test/", "/auth/login",
+            "/auth/callback?code=old", "/session/end", "/api/documents", "/health",
+            "/nested/../auth/login", "/nested/%2e%2e/auth/login",
+        ] {
+            assert!(login_return_url(&config, Some(destination)).is_none(), "accepted {destination:?}");
+        }
+        assert!(login_return_url(&config, Some(&format!("/{}", "x".repeat(4096)))).is_none());
+    }
+
     fn valid_token_body() -> serde_json::Value {
         json!({
             "access_token": "central-access-token",
@@ -1505,6 +1600,8 @@ mod tests {
         Json(json!({
             "id": "123e4567-e89b-12d3-a456-426614174000",
             "is_active": true,
+            "name": "Usuario central",
+            "email": "usuario@example.test",
         }))
     }
 
@@ -1731,6 +1828,7 @@ mod tests {
             OAuthTransaction {
                 verifier_hash: session_key(&verifier),
                 expires_at: Instant::now() + Duration::from_secs(300),
+                return_url: state.config.frontend_url.clone(),
             },
         );
         let mut headers = HeaderMap::new();
@@ -1807,12 +1905,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bff_flow_keeps_tokens_server_side_and_strips_spoofed_identity() { central_flow(false).await; }
+    async fn bff_flow_keeps_tokens_server_side_and_strips_spoofed_identity() { central_flow(false, false).await; }
 
     #[tokio::test]
-    async fn mixed_mode_supports_central_pkce_and_account_isolation() { central_flow(true).await; }
+    async fn mixed_mode_supports_central_pkce_and_account_isolation() { central_flow(true, false).await; }
 
-    async fn central_flow(mixed: bool) {
+    #[tokio::test]
+    async fn bff_login_returns_to_exact_location_bound_to_pkce() { central_flow(false, true).await; }
+
+    #[tokio::test]
+    async fn mixed_login_returns_to_exact_location_bound_to_pkce() { central_flow(true, true).await; }
+
+    async fn central_flow(mixed: bool, with_return: bool) {
         let upstream = Router::new()
             .route("/oauth/token", axum_post(mock_token))
             .route("/auth/introspect", get(mock_introspect))
@@ -1857,7 +1961,7 @@ mod tests {
             active_users: Arc::new(DashMap::new()),
             config,
         };
-        let gateway = build_app(state).unwrap();
+        let gateway = build_app(state.clone()).unwrap();
         tokio::spawn(async move {
             axum::serve(gateway_listener, gateway).await.unwrap();
         });
@@ -1868,8 +1972,15 @@ mod tests {
             .unwrap();
         let gateway_base = format!("http://{gateway_addr}");
 
-        let login = client
-            .get(format!("{gateway_base}/auth/login"))
+        let rejected_return = client.get(format!("{gateway_base}/auth/login"))
+            .query(&[("return_to", "https://evil.test/")]).send().await.unwrap();
+        assert_eq!(rejected_return.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(rejected_return.headers().get("Set-Cookie").is_none());
+        let mut login_request = client.get(format!("{gateway_base}/auth/login"));
+        if with_return {
+            login_request = login_request.query(&[("return_to", "/library/book?view=reader&page=487#citation-23")]);
+        }
+        let login = login_request
             .send()
             .await
             .unwrap();
@@ -1884,6 +1995,7 @@ mod tests {
             .all(|cookie| cookie.contains("HttpOnly")));
         let authorize =
             Url::parse(login.headers().get("Location").unwrap().to_str().unwrap()).unwrap();
+        assert!(!authorize.query_pairs().any(|(key, _)| key == "return_to"));
         let oauth_state = authorize
             .query_pairs()
             .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
@@ -1891,7 +2003,7 @@ mod tests {
 
         let callback = client
             .get(format!(
-                "{gateway_base}/auth/callback?code=valid-authorization-code-12345&state={oauth_state}"
+                "{gateway_base}/auth/callback?code=valid-authorization-code-12345&state={oauth_state}&return_to=https%3A%2F%2Fevil.test%2F"
             ))
             .header("Cookie", format!("{state_cookie}; {verifier_cookie}"))
             .send()
@@ -1905,7 +2017,8 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "http://127.0.0.1:8501/"
+            if with_return { "http://127.0.0.1:8501/library/book?view=reader&page=487#citation-23" }
+            else { "http://127.0.0.1:8501/" }
         );
         assert!(!callback
             .headers()
@@ -1930,8 +2043,8 @@ mod tests {
         let session_cookie = named_set_cookie(&callback, "smartdoc_session");
         let csrf_cookie = named_set_cookie(&callback, "smartdoc_csrf");
         assert!(!session_cookie.contains("central-access-token"));
-        let csrf_value = csrf_cookie.split_once('=').unwrap().1.to_string();
-        let browser_cookies = format!("{session_cookie}; {csrf_cookie}");
+        let mut csrf_value = csrf_cookie.split_once('=').unwrap().1.to_string();
+        let mut browser_cookies = format!("{session_cookie}; {csrf_cookie}");
 
         let me = client
             .get(format!("{gateway_base}/session/me"))
@@ -1941,9 +2054,14 @@ mod tests {
             .unwrap();
         assert_eq!(me.status(), reqwest::StatusCode::OK);
         let me=me.json::<serde_json::Value>().await.unwrap();
-        if mixed { assert_eq!(me["mode"],"account"); } else {
-            assert_eq!(me["subject"],"123e4567-e89b-12d3-a456-426614174000");
-        }
+        assert_eq!(me["mode"],"account");
+        assert_eq!(me["subject"],"123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(me["account_url"],"http://127.0.0.1:3000/account");
+        assert_eq!(me["user"]["id"],"123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(me["user"]["name"],"Usuario central");
+        assert_eq!(me["user"]["email"],"usuario@example.test");
+        assert!(me.get("access_token").is_none());
+        assert!(me.get("refresh_token").is_none());
 
         let product = client
             .get(format!("{gateway_base}/api/documents"))
@@ -1984,6 +2102,42 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.status(), reqwest::StatusCode::OK);
         assert_eq!(accepted.json::<serde_json::Value>().await.unwrap()["body_bytes"], 16);
+
+        if with_return {
+            // A process restart loses only BFF memory. It must fail closed for
+            // stale cookies and reattach the same central subject after SSO.
+            state.sessions.clear();
+            state.oauth_transactions.clear();
+            state.refresh_locks.clear();
+            let stale = client.get(format!("{gateway_base}/api/documents"))
+                .header("Cookie", format!("{browser_cookies}; sara_visitor=old-guest"))
+                .send().await.unwrap();
+            assert_eq!(stale.status(), reqwest::StatusCode::UNAUTHORIZED);
+            let login = client.get(format!("{gateway_base}/auth/login"))
+                .query(&[("return_to", "/library/book?view=reader&page=487#citation-23")])
+                .send().await.unwrap();
+            let state_cookie = named_set_cookie(&login, "smartdoc_oauth_state");
+            let verifier_cookie = named_set_cookie(&login, "smartdoc_oauth_verifier");
+            let authorize = Url::parse(login.headers().get("Location").unwrap().to_str().unwrap()).unwrap();
+            let oauth_state = authorize.query_pairs()
+                .find_map(|(key, value)| (key == "state").then(|| value.into_owned())).unwrap();
+            let callback = client.get(format!("{gateway_base}/auth/callback"))
+                .query(&[("code", "valid-authorization-code-12345"), ("state", &oauth_state)])
+                .header("Cookie", format!("{state_cookie}; {verifier_cookie}; {browser_cookies}"))
+                .send().await.unwrap();
+            assert_eq!(callback.status(), reqwest::StatusCode::SEE_OTHER);
+            assert_eq!(callback.headers().get("Location").unwrap().to_str().unwrap(),
+                "http://127.0.0.1:8501/library/book?view=reader&page=487#citation-23");
+            let session_cookie = named_set_cookie(&callback, "smartdoc_session");
+            let csrf_cookie = named_set_cookie(&callback, "smartdoc_csrf");
+            csrf_value = csrf_cookie.split_once('=').unwrap().1.to_string();
+            browser_cookies = format!("{session_cookie}; {csrf_cookie}");
+            let recovered = client.get(format!("{gateway_base}/api/documents"))
+                .header("Cookie", &browser_cookies).send().await.unwrap();
+            assert_eq!(recovered.status(), reqwest::StatusCode::OK);
+            assert_eq!(recovered.json::<serde_json::Value>().await.unwrap()["subject"],
+                "123e4567-e89b-12d3-a456-426614174000");
+        }
 
         let logout = client
             .post(format!("{gateway_base}{}",if mixed {"/session/end"} else {"/auth/logout"}))

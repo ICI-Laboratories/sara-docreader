@@ -217,10 +217,12 @@ footer small {
   min-width: 0;
 }
 .topbar {
-  height: 78px;
+  min-height: 78px;
   border-bottom: 1px solid var(--sara-border);
   padding: 0 48px;
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   align-items: center;
   justify-content: space-between;
   font-size: 12px;
@@ -232,7 +234,11 @@ footer small {
 }
 .private-badge {
   font-size: 11px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 240px;
 }
+.account-link { white-space: nowrap; }
 .private-badge::first-letter {
   color: var(--sara-action);
 }
@@ -801,8 +807,8 @@ dd {
     font-size: 10px;
   }
   .topbar {
-    height: 52px;
-    padding: 0 20px;
+    min-height: 52px;
+    padding: 12px 20px;
     font-size: 10px;
   }
   main {
@@ -969,3 +975,13 @@ dd {
   accent-color: var(--sara-action);
 }
 .privacy-note{margin-top:28px;color:var(--sara-text-secondary);font-size:11px;max-width:720px}.privacy-note summary{cursor:pointer;min-height:44px;padding:12px 0}.privacy-note p{line-height:1.7}.privacy-note button{font-size:12px}.answer-feedback{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:16px 0;font-size:12px}.answer-feedback small{width:100%;color:var(--sara-text-secondary)}
+
+.page-jump { display: flex; align-items: center; gap: 6px; }
+.page-jump input { width: 76px; min-height: 44px; padding: 8px; border: 1px solid var(--sara-border-control); border-radius: 6px; background: var(--sara-surface); color: var(--sara-text); }
+.pdf-toolbar { flex-wrap: wrap; }
+.search-help { font-size: 12px; }
+mark { background: var(--sara-warning-soft); color: var(--sara-text); font-weight: 600; }
+.chat-turn { border-bottom: 1px solid var(--sara-border); padding: 12px 0; }
+.chat-turn summary { cursor: pointer; min-height: 44px; font-weight: 600; overflow-wrap: anywhere; }
+.answer, .context-label { overflow-wrap: anywhere; }
+.search-results + button { margin-top: 16px; }

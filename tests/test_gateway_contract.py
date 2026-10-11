@@ -185,7 +185,8 @@ class GatewayContractTests(unittest.TestCase):
         doc_id, owner = uuid4(), uuid4()
         fake_response = MagicMock()
         fake_response.iter_lines.return_value = iter([
-            'data: {"choices":[{"delta":{"content":"Respuesta"}}]}', 'data: [DONE]'])
+            'data: {"choices":[{"delta":{"content":"Respuesta"}}]}',
+            'data: {"choices":[],"usage":{"completion_tokens":1}}', 'data: [DONE]'])
 
         @contextmanager
         def fake_stream(*args, **kwargs):
@@ -302,7 +303,8 @@ class GatewayContractTests(unittest.TestCase):
                     patch('httpx.post', side_effect=payloads) as post:
                 pages, chunks = worker.extract(path)
             self.assertEqual(pages, 2)
-            self.assertEqual(chunks, [{'page': 1, 'content': 'Primera página'}, {'page': 2, 'content': 'Segunda página'}])
+            self.assertEqual(chunks, [{'page': 1, 'content': 'Primera página', 'page_text': 'Primera página'},
+                                     {'page': 2, 'content': 'Segunda página', 'page_text': 'Segunda página'}])
             self.assertEqual(post.call_count, 2)
 
     def test_cpu_blank_pdf_rejected_but_mixed_blank_page_count_preserved(self):
@@ -319,7 +321,7 @@ class GatewayContractTests(unittest.TestCase):
                 worker.extract(blank)
             pages, chunks = worker.extract(mixed)
             self.assertEqual(pages, 2)
-            self.assertEqual(chunks, [{'page': 2, 'content': 'Texto nativo'}])
+            self.assertEqual(chunks, [{'page': 2, 'content': 'Texto nativo', 'page_text': 'Texto nativo'}])
             post.assert_not_called()
 
 

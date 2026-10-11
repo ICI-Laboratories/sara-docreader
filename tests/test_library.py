@@ -127,6 +127,75 @@ class LibraryTests(unittest.TestCase):
         with self.pool.connection() as conn:
             self.assertEqual(conn.execute('SELECT content FROM chunks').fetchone()['content'],'current')
 
+    def test_real_500_page_book_exact_pagination_question_and_reference_chain(self):
+        import pymupdf
+        from library_service.search import retrieve, referenced_sources
+        from library_service.context import evidence_context
+        with pymupdf.open() as pdf:
+            for number in range(1, 501):
+                page = pdf.new_page()
+                text = f'Libro de laboratorio. Contenido ordinario. Pagina {number}.'
+                if number == 487:
+                    text += '\nMicroelectrotermografia: calibracion verificada en [23].'
+                elif number == 233:
+                    text += '\n[23] Ramirez. Coeficiente experimental 0.731. Unidades en [71].\n[24] Otra obra cita [99].'
+                elif number == 119:
+                    text += '\n[71] Perez. La unidad de temperatura es kelvin.'
+                elif number == 55:
+                    text += '\n[99] Obra ajena a la cadena solicitada.'
+                page.insert_text((40, 60), text)
+            data = pdf.tobytes()
+        doc = self.upload(data, name='libro-500.pdf').json()['document']
+        self.process(doc)
+        params = {'q': 'microelectrotermografia', 'exact': True, 'doc_id': doc['id']}
+        result = self.client.get('/api/search', params=params, headers=self.headers)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual([row['page'] for row in result.json()['items']], [487])
+        self.assertEqual(result.json()['total'], 1)
+        all_pages = self.client.get('/api/search', params={'q': 'Contenido ordinario', 'exact': True, 'limit': 100}, headers=self.headers).json()
+        self.assertEqual(all_pages['total'], 500)
+        self.assertEqual(all_pages['next_offset'], 100)
+        last = self.client.get('/api/search', params={'q': 'Contenido ordinario', 'exact': True, 'offset': 400, 'limit': 100}, headers=self.headers).json()
+        self.assertEqual(last['items'][-1]['page'], 500)
+        self.assertIsNone(last['next_offset'])
+        self.assertFalse(last['has_more'])
+        result = retrieve(self.pool, self.owner, '¿Qué dice sobre microelectrotermografia?', document_ids=[doc['id']])
+        self.assertEqual(result['items'][0]['page'], 487)
+        references = referenced_sources(self.pool, self.owner, result['items'])
+        self.assertEqual([row['page'] for row in references], [233, 119])
+        self.assertEqual([row['reference_hop'] for row in references], [1, 2])
+        sources, context = evidence_context(result['items'], references)
+        self.assertEqual([source['page'] for source in sources], [487, 233, 119])
+        self.assertIn('0.731', context)
+        self.assertIn('kelvin', context)
+        foreign = self.client.get('/api/search', params={'q': 'microelectrotermografia', 'exact': True}, headers={'X-SmartDoc-Subject': str(self.other)}).json()
+        self.assertEqual(foreign['total'], 0)
+        self.assertEqual(referenced_sources(self.pool, self.other, result['items']), [])
+
+    def test_literal_wildcards_cross_chunk_phrase_and_legacy_migration(self):
+        from library_service.worker import claim, finish, split_text
+        from library_service.db import migrate
+        phrase = ' '.join(f'word{i:03}' for i in range(55))
+        content = 'x ' * 750 + phrase + ' z' * 500 + '\n100%_literal\\identifier'
+        chunks = [{'page': 1, 'content': part} for part in split_text(content)]
+        self.assertFalse(any(phrase in row['content'] for row in chunks))
+        chunks[0]['page_text'] = content
+        doc = self.upload().json()['document']
+        finish(self.pool, claim(self.pool), {'pages': 1, 'chunks': chunks})
+        for query in (phrase, '100%_literal\\identifier'):
+            response = self.client.get('/api/search', params={'q': query, 'exact': True}, headers=self.headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()['total'], 1)
+        self.assertEqual(self.client.get('/api/search', params={'q': '100X_literal', 'exact': True}, headers=self.headers).json()['total'], 0)
+        with self.pool.connection() as conn:
+            conn.execute('DELETE FROM document_pages')
+        migrate(self.pool)
+        migrate(self.pool)  # Upgrade is idempotent and reconstructs chunk overlap.
+        response = self.client.get('/api/search', params={'q': phrase, 'exact': True}, headers=self.headers)
+        self.assertEqual(response.json()['total'], 1, response.text)
+        with self.pool.connection() as conn:
+            self.assertEqual(conn.execute('SELECT count(*) AS count FROM document_pages').fetchone()['count'], 1)
+
     def test_failed_final_attempt_can_be_retried(self):
         from library_service.worker import claim, finish
         doc=self.upload().json()['document']

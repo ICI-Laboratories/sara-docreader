@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS chunks (
     PRIMARY KEY(document_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS chunks_terms ON chunks USING gin(terms);
+-- Literal lookup uses the whole page, including phrases across chunk boundaries.
+CREATE TABLE IF NOT EXISTS document_pages (
+    document_id uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    page integer NOT NULL,
+    content text NOT NULL,
+    searchable text GENERATED ALWAYS AS (lower(regexp_replace(content, '\s+', ' ', 'g'))) STORED,
+    PRIMARY KEY(document_id, page)
+);
+CREATE INDEX IF NOT EXISTS document_pages_literal ON document_pages USING gin(searchable gin_trgm_ops);
 -- Exact vector search initially; choose ANN only after measuring recall with owner filters.
 CREATE TABLE IF NOT EXISTS jobs (
     document_id uuid PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,

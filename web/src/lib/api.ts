@@ -65,38 +65,64 @@ export async function request<T>(
 export function uploadFile(
   file: File,
   progress: (n: number) => void,
+  signal?: AbortSignal,
 ): Promise<{ document: Document; duplicate: boolean }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/documents");
-    xhr.setRequestHeader("X-CSRF-Token", csrf());
+    let settled = false;
+    const cleanup = () => {
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      xhr.upload.onprogress = null;
+      xhr.onload = xhr.onerror = xhr.onabort = null;
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      cleanup();
+      reject(error);
+    };
+    const abort = () => {
+      fail(new DOMException("La subida fue cancelada.", "AbortError"));
+      xhr.abort();
+    };
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) progress(Math.round((100 * e.loaded) / e.total));
+      if (!settled && e.lengthComputable) progress(Math.round((100 * e.loaded) / e.total));
     };
     xhr.onerror = () =>
-      reject(
+      fail(
         new Error(
           "Se interrumpió la conexión. Puedes volver a subir el archivo.",
         ),
       );
+    xhr.onabort = () => fail(new DOMException("La subida fue cancelada.", "AbortError"));
     xhr.onload = () => {
+      if (settled) return;
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let result: { detail?: string; error?: string } = {};
+        try { result = JSON.parse(xhr.responseText); } catch { /* Keep the HTTP status even for a proxy error page. */ }
+        fail(new ApiError(xhr.status, result.detail || result.error || "No se pudo subir el archivo."));
+        return;
+      }
       try {
         const result = JSON.parse(xhr.responseText);
-        if (xhr.status >= 200 && xhr.status < 300) resolve(result);
-        else
-          reject(
-            new ApiError(
-              xhr.status,
-              result.detail || result.error || "No se pudo subir el archivo.",
-            ),
-          );
+        cleanup();
+        resolve(result);
       } catch {
-        reject(new Error("El servidor no devolvió una respuesta válida."));
+        fail(new Error("El servidor no devolvió una respuesta válida."));
       }
     };
-    const data = new FormData();
-    data.append("file", file);
-    xhr.send(data);
+    try {
+      xhr.open("POST", "/api/documents");
+      xhr.setRequestHeader("X-CSRF-Token", csrf());
+      const data = new FormData();
+      data.append("file", file);
+      xhr.send(data);
+    } catch (error) { fail(error); }
   });
 }
 export const states = {

@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 BROWSER_VALUES = {
     'library_view': {None}, 'page_view': {None}, 'citation_open': {None},
     'theme_changed': {'light', 'dark'},
-    'search_mode_changed': {'name', 'text', 'hybrid'},
+    'search_mode_changed': {'name', 'text', 'hybrid', 'exact'},
     'answer_feedback': {'positive', 'negative'},
 }
 SERVER_EVENTS = {

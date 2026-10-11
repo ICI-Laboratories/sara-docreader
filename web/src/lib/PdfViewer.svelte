@@ -9,6 +9,13 @@
   let loading = $state(true);
   let error = $state("");
   let width = $state(700);
+  let pageInput = $state<number | undefined>(1);
+  $effect(() => { pageInput = page; });
+  function jumpToPage() {
+    if (!pdf || pageInput === undefined || !Number.isFinite(pageInput)) return;
+    page = Math.min(pdf.numPages, Math.max(1, Math.trunc(pageInput)));
+    pageInput = page;
+  }
   let renderTask: RenderTask | undefined;
   onMount(() => {
     let disposed = false;
@@ -60,6 +67,7 @@
         try {
           const target = await doc.getPage(number);
           if (cancelled) return;
+          error = "";
           const viewport = target.getViewport({
             scale: Math.min(
               available / target.getViewport({ scale: 1 }).width,
@@ -106,6 +114,12 @@
     onclick={() => page++}
     aria-label="Página siguiente">→</button
   >
+  <form class="page-jump" onsubmit={(event) => { event.preventDefault(); jumpToPage(); }}>
+    <label class="sr-only" for={`page-${id}`}>Ir a la página</label>
+    <input id={`page-${id}`} type="number" min="1" max={pdf?.numPages ?? 1}
+      bind:value={pageInput} disabled={!pdf} aria-label="Ir a la página" />
+    <button class="secondary" disabled={!pdf}>Ir</button>
+  </form>
   <a
     class="button secondary"
     href={`/api/documents/${id}/file`}
